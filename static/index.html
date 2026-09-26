@@ -1,8 +1,301 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
-<h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>出海值守台 · 海上搜救协调</title>
+<style>
+:root{--ink:#17324d;--line:#cbd8e3;--bg:#f4f8fb;--red:#c0392b;--amber:#b9770e;--green:#1e8449;--blue:#2784c7}
+*{box-sizing:border-box}
+body{font:14px/1.55 system-ui,sans-serif;margin:0;background:var(--bg);color:var(--ink)}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:#0f2a43;color:#eaf4fb;padding:10px 18px}
+header h1{font-size:18px;margin:0;white-space:nowrap}
+header .who{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+header input,header select{padding:4px 6px;border-radius:4px;border:1px solid #567;background:#123554;color:#eaf4fb}
+#clock{font-variant-numeric:tabular-nums;color:#9fc6e8}
+#alerts{display:flex;gap:10px;padding:10px 18px;flex-wrap:wrap}
+.pill{padding:4px 12px;border-radius:999px;background:#fff;border:1px solid var(--line)}
+.pill b{font-size:16px;margin-right:4px}
+.pill.red{border-color:var(--red);color:var(--red)}
+.pill.amber{border-color:var(--amber);color:var(--amber)}
+.pill.green{border-color:var(--green);color:var(--green)}
+.pill.blue{border-color:var(--blue);color:var(--blue)}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px;padding:0 18px}
+section.col{background:#fff;border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+section.col h2{margin:2px 0 10px;font-size:15px;border-left:5px solid;padding-left:8px}
+.col.lost h2{border-color:var(--red);color:var(--red)}
+.col.ret h2{border-color:var(--amber);color:var(--amber)}
+.col.act h2{border-color:var(--green);color:var(--green)}
+.col.free h2{border-color:var(--blue);color:var(--blue)}
+.card{border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin-bottom:10px;background:#fbfdfe}
+.card.lost{border-color:#e6b0aa;background:#fdf3f2}
+.card.ret{border-color:#ecd2a8;background:#fdf9f0}
+.card.muted{opacity:.75}
+.badge{display:inline-block;padding:1px 8px;border-radius:4px;font-size:12px;color:#fff;background:var(--blue);margin:0 4px 2px 0}
+.badge.red{background:var(--red)}.badge.amber{background:var(--amber)}.badge.green{background:var(--green)}.badge.gray{background:#7f8c8d}
+.kv{color:#456;font-size:13px;margin:2px 0}
+.kv b{color:var(--ink)}
+.warn-text{color:var(--red);font-weight:600}
+form.row{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;align-items:center}
+input,select,button{font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:4px}
+input[type=number]{width:88px}
+button{background:var(--blue);color:#fff;border:none;cursor:pointer;padding:4px 12px;border-radius:4px}
+button.okb{background:var(--green)}button.amb{background:var(--amber)}button.dan{background:var(--red)}button.plain{background:#5d7a92}
+button:disabled{opacity:.5;cursor:default}
+#toast{position:fixed;top:10px;right:14px;padding:8px 14px;border-radius:6px;background:var(--green);color:#fff;display:none;z-index:9;max-width:60vw}
+#toast.err{background:var(--red)}
+#handover,#boards,#history{margin:14px 18px}
+section.panel{background:#fff;border:1px solid var(--line);border-radius:8px;padding:10px 14px}
+section.panel h2{margin:2px 0 10px;font-size:15px}
+table{border-collapse:collapse;width:100%;margin:8px 0;background:#fff}
+th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;font-size:13px}
+th{background:#edf5fb}
+.empty{color:#789;font-size:13px;padding:6px 0}
+.note{font-size:12px;color:#9fc6e8}
+.hint{font-size:12px;color:var(--red);margin-top:4px}
+details summary{cursor:pointer;font-weight:600;margin:6px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛟 出海值守台</h1>
+  <span id="clock">--:--:--</span>
+  <div class="who">
+    值班员 <input id="op" placeholder="姓名" size="8">
+    <select id="role">
+      <option value="coordinator">值班长</option>
+      <option value="operator" selected>值班员</option>
+      <option value="field">装备回报</option>
+    </select>
+    <span class="note">到点未报自动进失联栏 · 数据存库，重开页面继续跟进</span>
+  </div>
+</header>
+<div id="alerts"></div>
+<main>
+  <section class="col lost"><h2>失联装备（到点未报）</h2><div id="lost"></div></section>
+  <section class="col ret"><h2>返航中（余量低于回港线）</h2><div id="ret"></div></section>
+  <section class="col act"><h2>在航</h2><div id="act"></div></section>
+  <section class="col free"><h2>可派装备 · 派任务</h2><div id="free"></div></section>
+</main>
+<section id="handover" class="panel">
+  <h2>值班交接 · 待处理事项</h2>
+  <div id="notes"></div>
+  <form class="row" onsubmit="addNote(null);return false">
+    <input id="gn-reason" placeholder="通用交接事项：填写待处理原因" size="40">
+    <button type="submit" class="plain">登记通用事项</button>
+  </form>
+</section>
+<section id="boards" class="panel">
+  <details>
+    <summary>遇险事件与搜索区域（协调详情）</summary>
+    <h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
+    <h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
+  </details>
+</section>
+<section id="history" class="panel">
+  <details>
+    <summary>报位记录、已进港与时间线</summary>
+    <h2>最近报位</h2><table id="reports"><thead><tr><th>装备</th><th>位置</th><th>余量(km)</th><th>备注</th><th>记录人</th><th>时间</th></tr></thead><tbody></tbody></table>
+    <h2>已进港</h2><div id="arrived"></div>
+    <h2>时间线</h2><ol id="timeline"></ol>
+  </details>
+</section>
+<div id="toast"></div>
+<script>
+const S = {data:null};
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const KIND = {vessel:'搜救船', aircraft:'直升机'};
+const MSTATUS = {active:'在航', overdue:'失联', returning:'返航', arrived:'已进港'};
+
+function toast(msg, isErr){
+  const t = $('toast');
+  t.textContent = msg; t.className = isErr ? 'err' : ''; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 3500);
+}
+function needOp(){
+  if(!$('op').value.trim()){ toast('请先填写值班员姓名', true); $('op').focus(); return false; }
+  return true;
+}
+async function api(path, body){
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json','X-User':encodeURIComponent($('op').value.trim()),'X-Role':$('role').value}, body:JSON.stringify(body||{})});
+  const d = await r.json().catch(() => ({}));
+  if(!r.ok){ toast(d.error || ('请求失败 ' + r.status), true); throw new Error(d.error || r.status); }
+  return d;
+}
+const fmtT = iso => iso ? new Date(iso).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}) : '—';
+function left(iso){
+  const s = Math.round((new Date(iso) - Date.now())/1000), a = Math.abs(s);
+  const h = Math.floor(a/3600), m = Math.floor(a%3600/60);
+  const txt = (h ? h+'时' : '') + m + '分';
+  return s >= 0 ? '还有 ' + txt : '超时 ' + txt;
+}
+function localDT(d){
+  const p = n => String(n).padStart(2,'0');
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());
+}
+
+function openNotesFor(mid){
+  return (S.data.handover_notes||[]).filter(n => n.status==='open' && n.mission_id===mid);
+}
+function missionCard(m){
+  const low = m.margin_low, cls = m.status==='overdue' ? 'lost' : (m.status==='returning' ? 'ret' : '');
+  const badge = m.status==='overdue' ? '<span class="badge red">失联</span>'
+              : m.status==='returning' ? '<span class="badge amber">返航中</span>'
+              : '<span class="badge green">在航</span>';
+  const inc = m.incident_id ? (S.data.incidents.find(i => i.id===m.incident_id)||{}).code : null;
+  const notes = openNotesFor(m.id);
+  const needNote = (m.status==='overdue' || low || m.return_overdue) && !notes.length;
+  return `<div class="card ${cls}">
+    <div>${badge}<b>${esc(m.asset_name)}</b> <span class="kv">${esc(KIND[m.asset_kind]||m.asset_kind)}</span>
+      ${m.return_overdue ? '<span class="badge red">逾期未归</span>' : ''}
+      ${low ? '<span class="badge amber">余量低于回港线</span>' : ''}</div>
+    <div class="kv">任务：<b>${esc(m.task)}</b>${inc ? ' · 关联事件 <b>'+esc(inc)+'</b>' : ''}</div>
+    <div class="kv">最后船位：<b>${m.last_report_lat.toFixed(3)}, ${m.last_report_lon.toFixed(3)}</b> · 余量 <b class="${low?'warn-text':''}">${m.last_report_margin_km} km</b> / 回港线 ${m.min_return_margin_km} km</div>
+    <div class="kv">上次报位：${fmtT(m.last_report_at)} · 下次应报：<b data-due="${m.next_report_due}">${left(m.next_report_due)}</b>（${fmtT(m.next_report_due)}）</div>
+    <div class="kv">预计返港：<b class="${m.return_overdue?'warn-text':''}">${fmtT(m.expected_return_at)}</b> · 报位间隔 ${m.report_interval_min} 分钟${m.overdue_since ? ' · <span class="warn-text">失联始于 '+fmtT(m.overdue_since)+'</span>' : ''}</div>
+    ${notes.map(n => `<div class="kv">📌 交接：${esc(n.reason)}（${esc(n.created_by)}）</div>`).join('')}
+    ${needNote ? '<div class="hint">⚠ 交接班前请登记该项待处理原因</div>' : ''}
+    <form class="row" onsubmit="reportPos(${m.id});return false">
+      <input id="rp-lat-${m.id}" type="number" step="any" value="${m.last_report_lat}" title="纬度">
+      <input id="rp-lon-${m.id}" type="number" step="any" value="${m.last_report_lon}" title="经度">
+      <input id="rp-mg-${m.id}" type="number" step="any" min="0" placeholder="余量km" title="剩余返航余量">
+      <input id="rp-nt-${m.id}" placeholder="备注" size="8">
+      <button type="submit">${m.status==='overdue' ? '补报位（恢复联络）' : '报位'}</button>
+    </form>
+    <form class="row" onsubmit="addNote(${m.id});return false">
+      <input id="hn-${m.id}" placeholder="交接：待处理原因" size="18">
+      <button type="submit" class="plain">登记交接</button>
+      <button type="button" class="okb" onclick="arrive(${m.id})">确认进港</button>
+    </form>
+  </div>`;
+}
+function assetCard(a){
+  if(a.status !== 'available'){
+    const why = a.status==='deployed' ? '在航执行任务（见值守栏）' : '已被搜索区域占用';
+    return `<div class="card muted"><b>${esc(a.name)}</b> <span class="kv">${esc(KIND[a.kind]||a.kind)} · ${why}</span></div>`;
+  }
+  const eta = localDT(new Date(Date.now() + 4*3600*1000));
+  const incOpts = '<option value="">（不关联事件）</option>' + S.data.incidents
+    .filter(i => ['reported','coordinating','recovering'].includes(i.status))
+    .map(i => `<option value="${i.id}">${esc(i.code)} ${esc(i.vessel_name)}</option>`).join('');
+  return `<div class="card">
+    <div><span class="badge green">可派</span><b>${esc(a.name)}</b> <span class="kv">${esc(KIND[a.kind]||a.kind)} · 航程 ${a.range_km} km · ${a.speed_kn} 节</span></div>
+    <form class="row" onsubmit="dispatch(${a.id});return false">
+      <input id="dp-task-${a.id}" placeholder="任务说明" size="12">
+      <select id="dp-inc-${a.id}">${incOpts}</select>
+      <label class="kv">预计返港 <input id="dp-eta-${a.id}" type="datetime-local" value="${eta}"></label>
+      <label class="kv">报位间隔 <input id="dp-int-${a.id}" type="number" min="1" max="720" value="30" style="width:60px"> 分</label>
+      <label class="kv">最低返航余量 <input id="dp-min-${a.id}" type="number" step="any" min="0" placeholder="km" style="width:70px"> km</label>
+      <button type="submit">派出</button>
+    </form>
+  </div>`;
+}
+function render(){
+  const d = S.data; if(!d) return;
+  const open = d.missions.filter(m => m.open);
+  const lost = open.filter(m => m.status==='overdue');
+  const ret = open.filter(m => m.status==='returning');
+  const act = open.filter(m => m.status==='active');
+  const free = d.assets.filter(a => a.status==='available');
+  const openNotes = d.handover_notes.filter(n => n.status==='open');
+  $('alerts').innerHTML =
+    `<span class="pill red"><b>${lost.length}</b>失联</span>` +
+    `<span class="pill amber"><b>${ret.length}</b>返航中</span>` +
+    `<span class="pill green"><b>${act.length}</b>在航</span>` +
+    `<span class="pill blue"><b>${free.length}</b>可派</span>` +
+    `<span class="pill ${openNotes.length?'amber':''}"><b>${openNotes.length}</b>交接待办</span>`;
+  $('lost').innerHTML = lost.length ? lost.map(missionCard).join('') : '<div class="empty">无失联装备</div>';
+  $('ret').innerHTML = ret.length ? ret.map(missionCard).join('') : '<div class="empty">无返航中装备</div>';
+  $('act').innerHTML = act.length ? act.map(missionCard).join('') : '<div class="empty">当前无在航任务</div>';
+  $('free').innerHTML = d.assets.length ? d.assets.map(assetCard).join('') : '<div class="empty">尚未登记装备</div>';
+  $('notes').innerHTML = openNotes.length ? '<table><thead><tr><th>事项</th><th>待处理原因</th><th>登记</th><th></th></tr></thead><tbody>' +
+    openNotes.map(n => `<tr><td>${n.asset_name ? esc(n.asset_name)+' · '+esc(n.mission_task||'') : '通用'}${n.mission_status ? '（'+MSTATUS[n.mission_status]+'）' : ''}</td><td>${esc(n.reason)}</td><td>${esc(n.created_by)} ${fmtT(n.created_at)}</td><td><button class="okb" onclick="closeNote(${n.id})">办结</button></td></tr>`).join('') +
+    '</tbody></table>' : '<div class="empty">暂无待处理交接事项</div>';
+  const fill = (id, rows, cols) => { document.querySelector('#'+id+' tbody').innerHTML = rows.map(r => '<tr>'+cols.map(c => `<td>${esc(r[c] ?? '')}</td>`).join('')+'</tr>').join(''); };
+  fill('incidents', d.incidents, ['code','vessel_name','status','sea_state','lead_org','version']);
+  fill('areas', d.search_areas, ['code','incident_id','status','priority','assigned_asset_id']);
+  document.querySelector('#reports tbody').innerHTML = d.mission_reports.slice(0,20).map(r =>
+    `<tr><td>${esc(r.asset_name)}</td><td>${r.latitude.toFixed(3)}, ${r.longitude.toFixed(3)}</td><td>${r.margin_km}</td><td>${esc(r.note)}</td><td>${esc(r.reported_by)}</td><td>${fmtT(r.reported_at)}</td></tr>`).join('');
+  const arrived = d.missions.filter(m => m.status==='arrived').slice(0,8);
+  $('arrived').innerHTML = arrived.length ? arrived.map(m =>
+    `<span class="badge gray">${esc(m.asset_name)} · ${esc(m.task)} · 进港 ${fmtT(m.arrived_at)}</span>`).join(' ') : '<div class="empty">暂无</div>';
+  $('timeline').innerHTML = d.timeline.slice(0,20).map(x => `<li>${fmtT(x.created_at)} ${esc(x.actor)} ${esc(x.action)} ${esc(x.details)}</li>`).join('');
+}
+function snapshot(){
+  const v = {}, ae = document.activeElement;
+  document.querySelectorAll('input,select').forEach(el => { if(el.id) v[el.id] = el.value; });
+  return {v, aid: ae && ae.id, ss: ae && ae.selectionStart, se: ae && ae.selectionEnd};
+}
+function restore(s){
+  for(const k in s.v){ const el = $(k); if(el) el.value = s.v[k]; }
+  if(s.aid){ const el = $(s.aid); if(el){ el.focus(); try{ if(s.ss != null) el.setSelectionRange(s.ss, s.se); }catch(e){} } }
+}
+async function load(){
+  try{
+    const snap = document.querySelector('main') ? snapshot() : null;
+    const d = await fetch('/api/state').then(r => r.json());
+    S.data = d; render();
+    if(snap) restore(snap);
+  }catch(e){ /* 保留旧画面，下轮重试 */ }
+}
+
+async function dispatch(assetId){
+  if(!needOp()) return false;
+  const etaV = $('dp-eta-'+assetId).value;
+  if(!etaV){ toast('请填写预计返港时间', true); return false; }
+  await api('/api/missions', {
+    asset_id: assetId,
+    task: $('dp-task-'+assetId).value,
+    incident_id: $('dp-inc-'+assetId).value ? Number($('dp-inc-'+assetId).value) : null,
+    expected_return_at: new Date(etaV).toISOString(),
+    report_interval_min: Number($('dp-int-'+assetId).value),
+    min_return_margin_km: Number($('dp-min-'+assetId).value),
+  });
+  toast('已派出并登记返港/报位/余量要求'); await load(); return false;
+}
+async function reportPos(mid){
+  if(!needOp()) return false;
+  const mg = $('rp-mg-'+mid).value;
+  if(mg === ''){ toast('请填写剩余返航余量', true); return false; }
+  await api('/api/missions/report', {
+    mission_id: mid,
+    latitude: Number($('rp-lat-'+mid).value),
+    longitude: Number($('rp-lon-'+mid).value),
+    margin_km: Number(mg),
+    note: $('rp-nt-'+mid).value,
+  });
+  toast('报位已记录'); await load(); return false;
+}
+async function arrive(mid){
+  if(!needOp()) return false;
+  if(!confirm('确认该装备已进港？进港后任务结束，装备恢复可派。')) return false;
+  await api('/api/missions/arrive', {mission_id: mid});
+  toast('已确认进港，装备恢复可派'); await load(); return false;
+}
+async function addNote(mid){
+  if(!needOp()) return false;
+  const el = mid == null ? $('gn-reason') : $('hn-'+mid);
+  if(!el.value.trim()){ toast('请填写待处理原因', true); el.focus(); return false; }
+  await api('/api/handover', {mission_id: mid, reason: el.value.trim()});
+  toast('交接事项已登记'); await load(); return false;
+}
+async function closeNote(nid){
+  if(!needOp()) return false;
+  await api('/api/handover/close', {note_id: nid});
+  toast('交接事项已办结'); await load(); return false;
+}
+
+$('op').value = localStorage.getItem('watch.op') || '';
+$('role').value = localStorage.getItem('watch.role') || 'operator';
+$('op').addEventListener('change', () => localStorage.setItem('watch.op', $('op').value.trim()));
+$('role').addEventListener('change', () => localStorage.setItem('watch.role', $('role').value));
+setInterval(() => {
+  $('clock').textContent = new Date().toLocaleString('zh-CN',{hour12:false});
+  document.querySelectorAll('[data-due]').forEach(el => el.textContent = left(el.dataset.due));
+}, 1000);
+setInterval(load, 10000);
+load();
+</script>
+</body>
+</html>
