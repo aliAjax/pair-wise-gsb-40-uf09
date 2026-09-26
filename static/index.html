@@ -1,8 +1,356 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
-<h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>出海值守台 · 海上搜救协调</title>
+<style>
+  :root{--ink:#17324d;--line:#cbd8e3;--blue:#2784c7;--red:#c0392b;--amber:#b9770e;--green:#1e8449;--bg:#eef3f7}
+  *{box-sizing:border-box}
+  body{font:14px/1.55 system-ui,sans-serif;margin:0;background:var(--bg);color:var(--ink)}
+  header{background:#0f2d47;color:#fff;padding:12px 20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+  header h1{font-size:18px;margin:0;margin-right:8px}
+  header .sub{opacity:.75;font-size:12px}
+  header .spacer{flex:1}
+  header label{font-size:12px;display:flex;align-items:center;gap:4px}
+  header input,header select{padding:4px 6px;border:none;border-radius:3px;font-size:13px}
+  main{max-width:1280px;margin:18px auto;padding:0 16px}
+  .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  .toolbar .clock{font-size:12px;color:#4d6b88}
+  .stats{display:flex;gap:10px;flex-wrap:wrap}
+  .stat{background:#fff;border:1px solid var(--line);border-radius:6px;padding:6px 12px;font-size:13px}
+  .stat b{font-size:16px;margin-left:6px}
+  .stat.overdue b{color:var(--red)}.stat.returning b{color:var(--amber)}.stat.duty b{color:var(--blue)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;align-items:start}
+  section.panel{background:#fff;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  section.panel>h2{margin:0;padding:10px 14px;font-size:15px;background:#edf5fb;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+  section.panel.overdue>h2{background:#fdecea;color:#7b241c}
+  section.panel.returning>h2{background:#fef5e7;color:#7e5109}
+  section.panel .body{padding:12px;display:flex;flex-direction:column;gap:10px}
+  .empty{color:#7f92a5;font-size:13px;padding:6px 2px}
+  .card{border:1px solid var(--line);border-radius:6px;padding:10px 12px;background:#fbfdff}
+  .card.overdue{border-color:var(--red);background:#fdf3f2}
+  .card.returning{border-color:var(--amber);background:#fffaf2}
+  .card h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .tag{font-size:11px;padding:1px 7px;border-radius:10px;background:#d6eaf8;color:#1a5276}
+  .tag.vessel{background:#d6eaf8}.tag.aircraft{background:#e8daef;color:#5b2c6f}
+  .tag.st-overdue{background:var(--red);color:#fff}.tag.st-returning{background:var(--amber);color:#fff}.tag.st-on_duty{background:var(--blue);color:#fff}.tag.st-in_port{background:#95a5a6;color:#fff}
+  dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:6px 0;font-size:13px}
+  dt{color:#5d7690;white-space:nowrap}dd{margin:0}
+  .low{color:var(--red);font-weight:700}.ok{color:var(--green)}
+  .due-late{color:var(--red);font-weight:700}
+  .mini{display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin-top:8px;border-top:1px dashed var(--line);padding-top:8px}
+  .mini label{font-size:11px;color:#5d7690;display:flex;flex-direction:column;gap:2px}
+  .mini input{width:88px;padding:3px 5px;border:1px solid var(--line);border-radius:3px;font-size:12px}
+  button{cursor:pointer;border:1px solid var(--blue);background:var(--blue);color:#fff;border-radius:4px;padding:5px 12px;font-size:13px}
+  button.ghost{background:#fff;color:var(--blue)}
+  button.danger{border-color:var(--red);background:var(--red)}
+  button.warn{border-color:var(--amber);background:var(--amber)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  form.dispatch{background:#fff;border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;align-items:end}
+  form.dispatch h2{grid-column:1/-1;margin:0;font-size:15px}
+  form.dispatch label,form.handover label{font-size:12px;color:#5d7690;display:flex;flex-direction:column;gap:3px}
+  form.dispatch input,form.dispatch select,form.handover input,form.handover textarea,form.handover select{padding:5px 7px;border:1px solid var(--line);border-radius:4px;font-size:13px;width:100%}
+  form.handover{background:#fff;border:1px solid var(--line);border-radius:8px;padding:12px 14px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  form.handover h2,.full{grid-column:1/-1}
+  form.handover textarea{min-height:48px;resize:vertical}
+  .handover{border-left:4px solid var(--blue);background:#f7fbfe}
+  .handover.resolved{border-left-color:var(--green);opacity:.75}
+  .handover.following{border-left-color:var(--amber)}
+  .handover .meta{font-size:11px;color:#6b8198;margin:2px 0 6px}
+  .handover p{margin:4px 0;font-size:13px}
+  .handover .actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+  details.bg{background:#fff;border:1px solid var(--line);border-radius:8px;margin-top:16px;padding:0 14px}
+  details.bg summary{cursor:pointer;padding:10px 0;font-weight:600}
+  table{border-collapse:collapse;width:100%;margin:8px 0 14px;font-size:12.5px}
+  th,td{border:1px solid var(--line);padding:5px 8px;text-align:left}th{background:#edf5fb}
+  #toast{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50}
+  .toast{background:#0f2d47;color:#fff;padding:9px 14px;border-radius:6px;font-size:13px;max-width:340px;box-shadow:0 4px 14px rgba(0,0,0,.25)}
+  .toast.err{background:var(--red)}.toast.ok{background:var(--green)}
+  .coords{font-variant-numeric:tabular-nums}
+  code{background:#f2f5f7;padding:1px 4px;border-radius:3px}
+</style>
+</head>
+<body>
+<header>
+  <h1>出海值守台</h1>
+  <span class="sub">派任务登记返港 / 报位 / 返航余量 · 到点未报自动失联 · 进港前不接新任务</span>
+  <span class="spacer"></span>
+  <label>值班员 <input id="user" value="coord1" size="9"></label>
+  <label>角色
+    <select id="role">
+      <option value="coordinator" selected>coordinator 协调员</option>
+      <option value="operator">operator 值班员</option>
+      <option value="field">field 现场</option>
+      <option value="analyst">analyst 分析员</option>
+      <option value="viewer">viewer 只读</option>
+    </select>
+  </label>
+  <button class="ghost" onclick="load(true)">手动刷新</button>
+  <label style="color:#cfe3f5"><input type="checkbox" id="autoref" checked> 20 秒自动刷新</label>
+</header>
+<main>
+  <div class="toolbar">
+    <div class="stats" id="stats"></div>
+    <span class="spacer" style="flex:1"></span>
+    <span class="clock" id="clock"></span>
+  </div>
+
+  <form class="dispatch" id="dispatchForm" onsubmit="return dispatch(event)">
+    <h2>派出任务（出海前必须登记三件套）</h2>
+    <label>搜索区域（待分配）
+      <select name="area_id" id="dpArea" required></select>
+    </label>
+    <label>装备（在港可用）
+      <select name="asset_id" id="dpAsset" required></select>
+    </label>
+    <label>预计返港时间
+      <input type="datetime-local" name="expected_return_at" id="dpEta" step="60" required>
+    </label>
+    <label>定时报位间隔（分钟）
+      <input type="number" name="report_interval_min" value="60" min="1" max="1440" required>
+    </label>
+    <label>最低返航余量（公里/回港线）
+      <input type="number" name="min_return_margin_km" value="40" min="0.1" step="0.1" required>
+    </label>
+    <button type="submit">登记并派出</button>
+  </form>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>在航值守 <span id="cntOnDuty"></span></h2>
+      <div class="body" id="colOnDuty"></div>
+    </section>
+    <section class="panel overdue">
+      <h2>失联栏（到点未报）<span id="cntOverdue"></span></h2>
+      <div class="body" id="colOverdue"></div>
+    </section>
+    <section class="panel returning">
+      <h2>返航中 <span id="cntReturning"></span></h2>
+      <div class="body" id="colReturning"></div>
+    </section>
+  </div>
+
+  <section class="panel" style="margin-top:14px">
+    <h2>值班交接（逐项留待处理原因，重开页面继续跟进）</h2>
+    <div class="body">
+      <form class="handover" id="handoverForm" onsubmit="return createHandover(event)">
+        <h2>新增交接事项</h2>
+        <label>事项
+          <input name="title" placeholder="如：夜班会守海巡01 报位" required>
+        </label>
+        <label>关联装备（可选）
+          <select name="asset_id" id="hvAsset"><option value="">— 不关联具体装备 —</option></select>
+        </label>
+        <label class="full">待处理原因 / 背景
+          <textarea name="reason" placeholder="为什么需要下一班继续处理" required></textarea>
+        </label>
+        <label class="full">初步跟进说明（可选）
+          <textarea name="follow_up" placeholder="接班后可以直接补充处理进展"></textarea>
+        </label>
+        <div class="full"><button type="submit">留给下一班</button></div>
+      </form>
+      <div id="handoverList" style="display:flex;flex-direction:column;gap:8px;margin-top:12px"></div>
+    </div>
+  </section>
+
+  <section class="panel" style="margin-top:14px">
+    <h2>最近进港记录</h2>
+    <div class="body" id="colArrived"></div>
+  </section>
+
+  <details class="bg">
+    <summary>背景数据：遇险事件 / 搜索区域 / 资源 / 时间线</summary>
+    <h3>遇险事件</h3>
+    <table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
+    <h3>全部资源</h3>
+    <table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程(km)</th><th>当前位置</th></tr></thead><tbody></tbody></table>
+    <h3>搜索区域</h3>
+    <table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
+    <h3>时间线（近 25 条）</h3>
+    <ol id="timeline"></ol>
+  </details>
+</main>
+<div id="toast"></div>
+
+<script>
+let DATA=null;
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function toast(msg,kind=''){const t=document.createElement('div');t.className='toast '+kind;t.textContent=msg;$('#toast').appendChild(t);setTimeout(()=>t.remove(),4200)}
+function headers(){return {'Content-Type':'application/json','X-User':$('#user').value||'viewer','X-Role':$('#role').value}}
+async function api(path,payload){
+  const r=await fetch(path,{method:'POST',headers:headers(),body:JSON.stringify(payload)});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.error||('请求失败 '+r.status));
+  return d;
+}
+function fmt(ts){if(!ts)return '—';const d=new Date(ts);if(isNaN(d))return ts;return d.toLocaleString('zh-CN',{hour12:false})}
+function hm(ms){if(ms<0)ms=0;const m=Math.floor(ms/60000);const d=Math.floor(m/1440),h=Math.floor(m%1440/60),mm=m%60;if(d)return d+'天'+h+'小时';if(h)return h+'小时'+mm+'分';return mm+'分钟'}
+function nowLocalInput(d=new Date(Date.now()+4*3600*1000)){
+  const p=n=>String(n).padStart(2,'0');
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());
+}
+
+function activeWatch(assetId){return (DATA.watches||[]).find(w=>w.asset_id===assetId&&['on_duty','overdue','returning'].includes(w.status))}
+
+function watchCard(w){
+  const overdue=w.status==='overdue',returning=w.status==='returning';
+  const cls=overdue?'overdue':returning?'returning':'';
+  const low=w.last_margin_km!=null&&w.last_margin_km<w.min_return_margin_km;
+  const due=new Date(w.next_report_due);
+  const dueLate=Date.now()>due.getTime();
+  let dueHtml;
+  if(overdue&&w.overdue_since){
+    dueHtml=`<span class="due-late">已失联 ${hm(Date.now()-new Date(w.overdue_since).getTime())}</span><br><small>应报 ${fmt(w.next_report_due)}</small>`;
+  }else{
+    dueHtml=`<span class="${dueLate?'due-late':''}">${dueLate?'超期':'距下次报位'} ${hm(Math.abs(due.getTime()-Date.now()))}</span><br><small>截止 ${fmt(w.next_report_due)}</small>`;
+  }
+  const etaLate=Date.now()>new Date(w.eta_return).getTime();
+  return `<div class="card ${cls}">
+    <h3>${esc(w.asset_name)} <span class="tag ${w.asset_kind}">${w.asset_kind==='aircraft'?'直升机':'船舶'}</span>
+      <span class="tag st-${w.status}">${statusLabel(w.status)}</span></h3>
+    <dl>
+      <dt>任务区域</dt><dd>${esc(w.area_code||'—')}（事件 ${esc(w.incident_code||'—')}）</dd>
+      <dt>预计返港</dt><dd class="${etaLate?'due-late':''}">${fmt(w.eta_return)}${etaLate?' · 已过预计时间':''}</dd>
+      <dt>报位间隔</dt><dd>${w.report_interval_min} 分钟</dd>
+      <dt>下次报位</dt><dd>${dueHtml}</dd>
+      <dt>最后船位</dt><dd class="coords">${w.last_lat!=null?w.last_lat.toFixed(4)+', '+w.last_lon.toFixed(4):'出港后尚未报位'}</dd>
+      <dt>最近报位</dt><dd>${fmt(w.last_report_at)}</dd>
+      <dt>返航余量</dt><dd class="${low?'low':'ok'}">${w.last_margin_km!=null?w.last_margin_km+' km':'—'} / 回港线 ${w.min_return_margin_km} km${low?' · 低于回港线':''}</dd>
+    </dl>
+    ${overdue?'<div style="font-size:12px;color:#7b241c">联络中断：恢复联络时必须补报位置和返航余量。</div>':''}
+    <div class="mini">
+      <label>纬度<input id="lat-'+w.asset_id+'" value="${(w.last_lat??31.0).toFixed(3)}" inputmode="decimal"></label>
+      <label>经度<input id="lon-'+w.asset_id+'" value="${(w.last_lon??122.0).toFixed(3)}" inputmode="decimal"></label>
+      <label>余量km<input id="mg-'+w.asset_id+'" value="${w.last_margin_km??''}" placeholder="必填" inputmode="decimal" oninput="this.dataset.touched=1"></label>
+      <label>备注<input id="nt-'+w.asset_id+'" placeholder="报位备注"></label>
+      <button onclick="report(${w.asset_id})">${overdue?'恢复联络·补报':'报位'}</button>
+      <button class="danger" onclick="arrive(${w.asset_id})">确认进港</button>
+    </div>
+  </div>`;
+}
+function statusLabel(s){return {on_duty:'在航值守',overdue:'失联',returning:'返航中',in_port:'已进港'}[s]||s}
+
+async function report(assetId){
+  const lat=parseFloat($('#lat-'+assetId).value), lon=parseFloat($('#lon-'+assetId).value);
+  const mg=$('#mg-'+assetId).value, note=$('#nt-'+assetId).value;
+  if(mg===''||isNaN(parseFloat(mg))){toast('报位必须填写返航余量','err');return}
+  const w=activeWatch(assetId);
+  if(w&&w.status==='overdue'&&(isNaN(lat)||isNaN(lon))){toast('恢复联络必须补报位置','err');return}
+  try{
+    const r=await api('/api/watches/position',{asset_id:assetId,latitude:lat,longitude:lon,remaining_margin_km:parseFloat(mg),note});
+    toast(r.status==='returning'?'余量低于回港线，已转返航':'报位已登记','ok');
+    load();
+  }catch(e){toast(e.message,'err')}
+}
+async function arrive(assetId){
+  if(!confirm('确认该装备已安全进港？确认后释放任务并可重新派工。'))return;
+  try{await api('/api/watches/arrival',{asset_id:assetId});toast('已确认进港，资源回到在港可用','ok');load()}
+  catch(e){toast(e.message,'err')}
+}
+async function dispatch(ev){
+  ev.preventDefault();
+  const f=ev.target,p=Object.fromEntries(new FormData(f).entries());
+  if(!p.area_id){toast('没有待分配的搜索区域','err');return false}
+  const d=new Date(p.expected_return_at);
+  const payload={area_id:parseInt(p.area_id),asset_id:parseInt(p.asset_id),
+    expected_return_at:d.toISOString(),report_interval_min:parseInt(p.report_interval_min),
+    min_return_margin_km:parseFloat(p.min_return_margin_km)};
+  try{await api('/api/assignments',payload);toast('任务已派出，值守计划已登记','ok');f.reset();$('#dpEta').value=nowLocalInput();load()}
+  catch(e){toast(e.message,'err')}
+  return false;
+}
+function handoverCard(h){
+  const cls=h.status==='resolved'?'resolved':h.status==='following'?'following':'';
+  return `<div class="card handover ${cls}">
+    <h3 style="font-size:14px">${esc(h.title)} <span class="tag st-${h.status==='open'?'on_duty':h.status==='following'?'returning':'in_port'}">${({open:'待处理',following:'跟进中',resolved:'已办结'})[h.status]}</span></h3>
+    <div class="meta">登记：${esc(h.created_by)} @ ${fmt(h.created_at)} · 关联：${esc(h.asset_name||'通用事项')}${h.watch_status?' · 装备当前 '+statusLabel(h.watch_status):''}</div>
+    <p><b>待处理原因：</b>${esc(h.reason)}</p>
+    <p><b>跟进：</b>${esc(h.follow_up)||'（尚无进展）'}</p>
+    ${h.status==='resolved'?'':`<div class="actions">
+      <input id="fu-${h.id}" placeholder="补充处理进展…" style="flex:1;min-width:180px;padding:4px 7px;border:1px solid #cbd8e3;border-radius:4px;font-size:12px">
+      <button class="ghost" onclick="followHandover(${h.id})">保存进展</button>
+      ${h.status==='open'?`<button class="warn" onclick="setStatus(${h.id},'following')">开始跟进</button>`:''}
+      <button onclick="setStatus(${h.id},'resolved')">办结</button>
+    </div>`}
+  </div>`;
+}
+async function followHandover(id){
+  const fu=$('#fu-'+id).value;
+  try{await api('/api/handovers/update',{handover_id:id,follow_up:fu});toast('进展已记录','ok');load()}catch(e){toast(e.message,'err')}
+}
+async function setStatus(id,status){
+  let follow_up;
+  if(status==='resolved'){follow_up=prompt('办结说明（可留空）','');if(follow_up===null)return}
+  try{await api('/api/handovers/update',{handover_id:id,status,follow_up});toast('交接事项已更新','ok');load()}catch(e){toast(e.message,'err')}
+}
+async function createHandover(ev){
+  ev.preventDefault();const f=ev.target,p=Object.fromEntries(new FormData(f).entries());
+  const payload={title:p.title,reason:p.reason,follow_up:p.follow_up||''};
+  if(p.asset_id)payload.asset_id=parseInt(p.asset_id);
+  try{await api('/api/handovers',payload);toast('交接事项已留给下一班','ok');f.reset();renderForms();load()}catch(e){toast(e.message,'err')}
+  return false;
+}
+
+function renderForms(){
+  const freeAreas=(DATA.search_areas||[]).filter(a=>!a.assigned_asset_id&&['planned'].includes(a.status));
+  const keepArea=$('#dpArea').value, keepAsset=$('#dpAsset').value, keepHv=$('#hvAsset').value;
+  $('#dpArea').innerHTML=freeAreas.length?freeAreas.map(a=>`<option value="${a.id}">${esc(a.code)} · 事件 ${esc(a.incident_id)} · ${esc(a.kind)}</option>`).join(''):'<option value="">无待分配区域</option>';
+  const freeAssets=(DATA.assets||[]).filter(a=>a.status==='available');
+  $('#dpAsset').innerHTML=freeAssets.map(a=>`<option value="${a.id}">${esc(a.name)}（${a.kind==='aircraft'?'直升机':'船舶'}）</option>`).join('')||'<option value="">无可用装备</option>';
+  $('#hvAsset').innerHTML='<option value="">— 不关联具体装备 —</option>'+DATA.assets.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
+  if([...$('#dpArea').options].some(o=>o.value===keepArea))$('#dpArea').value=keepArea;
+  if([...$('#dpAsset').options].some(o=>o.value===keepAsset))$('#dpAsset').value=keepAsset;
+  if([...$('#hvAsset').options].some(o=>o.value===keepHv))$('#hvAsset').value=keepHv;
+}
+
+function renderColumn(elId, cards){
+  const el=$('#'+elId);
+  const html=cards.map(watchCard).join('')||'<div class="empty">'+({colOnDuty:'暂无在航装备',colOverdue:'无失联装备',colReturning:'无返航中装备'})[elId]+'</div>';
+  // 卡片内有正在填写的报位表单时，避免定时刷新打断输入
+  const typing=el.querySelector('input:focus')||[...el.querySelectorAll('input')].some(i=>i.id.startsWith('mg-')&&i.dataset.touched);
+  if(!typing)el.innerHTML=html;
+}
+
+function render(){
+  const w=DATA.watches||[];
+  const by=s=>w.filter(x=>x.status===s);
+  renderColumn('colOnDuty',by('on_duty'));
+  renderColumn('colOverdue',by('overdue'));
+  renderColumn('colReturning',by('returning'));
+  $('#cntOnDuty').textContent=by('on_duty').length;
+  $('#cntOverdue').textContent=by('overdue').length;
+  $('#cntReturning').textContent=by('returning').length;
+  $('#colArrived').innerHTML=by('in_port').slice(0,6).map(x=>
+    `<div class="card"><b>${esc(x.asset_name)}</b> 于 ${fmt(x.arrived_at)} 确认进港（任务 ${esc(x.area_code||'—')}，派出 ${fmt(x.created_at)}）</div>`
+  ).join('')||'<div class="empty">暂无进港记录</div>';
+  const hs=DATA.handovers||[];
+  $('#handoverList').innerHTML=hs.map(handoverCard).join('')||'<div class="empty">暂无交接事项</div>';
+  $('#stats').innerHTML=`
+    <span class="stat duty">在航<b>${by('on_duty').length}</b></span>
+    <span class="stat overdue">失联<b>${by('overdue').length}</b></span>
+    <span class="stat returning">返航<b>${by('returning').length}</b></span>
+    <span class="stat">待交接<b>${hs.filter(h=>h.status!=='resolved').length}</b></span>`;
+  // 背景表
+  const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${Array.isArray(c)?c[1](r[c[0]]):esc(r[c])}</td>`).join('')+'</tr>').join('')};
+  fill('incidents',DATA.incidents,['code','vessel_name','status','sea_state','lead_org','version']);
+  fill('assets',DATA.assets,['name','kind','status','range_km',['x',r=>`${r.latitude.toFixed(3)}, ${r.longitude.toFixed(3)}`]]);
+  fill('areas',DATA.search_areas,['code','incident_id','status','priority','assigned_asset_id']);
+  $('#timeline').innerHTML=DATA.timeline.slice(0,25).map(x=>`<li>${fmt(x.created_at)} <code>${esc(x.action)}</code> ${esc(x.details)}</li>`).join('');
+  $('#clock').textContent='服务器时间 '+fmt(DATA.server_time)+' · 本地 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+}
+
+async function load(manual){
+  try{
+    DATA=await fetch('/api/state').then(r=>r.json());
+    if(!$('#dpEta').value)$('#dpEta').value=nowLocalInput();
+    renderForms();render();
+    if(manual)toast('状态已刷新','ok');
+  }catch(e){if(manual)toast(e.message,'err')}
+}
+setInterval(()=>{if($('#autoref').checked)load()},20000);
+load();
+</script>
+</body>
+</html>

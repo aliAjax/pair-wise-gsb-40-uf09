@@ -6,7 +6,7 @@ import json
 import math
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -16,6 +16,25 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "maritime_sar.db"
 ACTIVE_INCIDENT = {"reported", "coordinating", "recovering"}
 CLOSED_INCIDENT = {"closed", "cancelled", "duplicate"}
+WATCH_ACTIVE_STATUSES = ("on_duty", "overdue", "returning")
+WATCH_OPEN_STATUSES = ("on_duty", "overdue", "returning")
+HANDOVER_OPEN_STATUSES = ("open", "following")
+
+
+def parse_ts(value: Any, field: str) -> datetime:
+    """Parse an ISO-8601 timestamp into an aware UTC datetime."""
+    text = str(value or "").strip()
+    if not text:
+        raise DomainError("%s不能为空" % field)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise DomainError("%s时间格式无效（需 ISO-8601）" % field) from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 class DomainError(Exception):
@@ -161,8 +180,58 @@ class MaritimeSARService:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS asset_watches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    area_id INTEGER REFERENCES search_areas(id),
+                    incident_id INTEGER REFERENCES incidents(id),
+                    status TEXT NOT NULL DEFAULT 'on_duty',
+                    eta_return TEXT NOT NULL,
+                    report_interval_min INTEGER NOT NULL,
+                    min_return_margin_km REAL NOT NULL,
+                    last_report_at TEXT,
+                    last_lat REAL,
+                    last_lon REAL,
+                    last_margin_km REAL,
+                    next_report_due TEXT,
+                    overdue_since TEXT,
+                    assigned_by TEXT NOT NULL,
+                    arrived_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS position_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watch_id INTEGER NOT NULL REFERENCES asset_watches(id),
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    latitude REAL NOT NULL,
+                    longitude REAL NOT NULL,
+                    margin_km REAL NOT NULL,
+                    source_status TEXT NOT NULL,
+                    reporter TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    reported_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS watch_handovers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    watch_id INTEGER REFERENCES asset_watches(id),
+                    asset_id INTEGER REFERENCES assets(id),
+                    title TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_by TEXT NOT NULL,
+                    owned_by TEXT NOT NULL,
+                    follow_up TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_clues_incident ON clues(incident_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_active_asset
+                    ON asset_watches(asset_id) WHERE status IN ('on_duty','overdue','returning');
+                CREATE INDEX IF NOT EXISTS idx_watch_status ON asset_watches(status, next_report_due);
+                CREATE INDEX IF NOT EXISTS idx_position_reports_watch ON position_reports(watch_id, id);
+                CREATE INDEX IF NOT EXISTS idx_handovers_status ON watch_handovers(status, id);
                 """
             )
 
@@ -290,9 +359,24 @@ class MaritimeSARService:
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (cur.lastrowid,)).fetchone())
 
     def assign_area(self, actor: str, role: str, area_id: int, asset_id: int,
+                    expected_return_at: Any, report_interval_min: Any,
+                    min_return_margin_km: Any,
                     expected_asset_version: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
         require_role(role, {"coordinator"}, "分配搜索任务")
+        eta = parse_ts(expected_return_at, "预计返港时间")
+        try:
+            interval = int(report_interval_min)
+            margin_line = float(min_return_margin_km)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("报位间隔和最低返航余量必须是数值") from exc
+        if interval < 1 or interval > 1440:
+            raise DomainError("报位间隔应在 1 到 1440 分钟之间")
+        if margin_line <= 0:
+            raise DomainError("最低返航余量必须大于 0 公里")
+        now = datetime.now(timezone.utc)
+        if eta <= now:
+            raise DomainError("预计返港时间必须晚于当前时间")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
@@ -316,19 +400,34 @@ class MaritimeSARService:
             distance = haversine_km(asset["latitude"], asset["longitude"], area["center_lat"], area["center_lon"])
             if distance > asset["range_km"]:
                 raise DomainError("搜索区域超出资源航程", 409)
-            now = utcnow()
+            now_ts = now.isoformat(timespec="seconds")
             changed = conn.execute(
                 "UPDATE assets SET status='assigned',version=version+1,updated_at=? WHERE id=? AND status='available' AND version=?",
-                (now, asset_id, asset["version"]),
+                (now_ts, asset_id, asset["version"]),
             )
             if changed.rowcount != 1:
                 raise DomainError("资源已被其他任务占用", 409)
             conn.execute(
                 "UPDATE search_areas SET assigned_asset_id=?,status='assigned',version=version+1,updated_at=? WHERE id=?",
-                (asset_id, now, area_id),
+                (asset_id, now_ts, area_id),
+            )
+            first_due = now + timedelta(minutes=interval)
+            watch_cur = conn.execute(
+                """INSERT INTO asset_watches(asset_id,area_id,incident_id,status,eta_return,report_interval_min,
+                   min_return_margin_km,next_report_due,assigned_by,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (asset_id, area_id, area["incident_id"], "on_duty", eta.isoformat(timespec="seconds"),
+                 interval, margin_line, first_due.isoformat(timespec="seconds"), actor, now_ts, now_ts),
             )
             self._audit(conn, area["incident_id"], actor, "area.assigned", {"area_id": area_id, "asset_id": asset_id, "distance_km": round(distance, 2)})
-            return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
+            self._audit(conn, area["incident_id"], actor, "watch.dispatched", {
+                "watch_id": watch_cur.lastrowid, "asset_id": asset_id,
+                "eta_return": eta.isoformat(timespec="seconds"),
+                "report_interval_min": interval, "min_return_margin_km": margin_line,
+            })
+            result = dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
+            result["watch_id"] = watch_cur.lastrowid
+            return result
 
     def record_clue(self, actor: str, role: str, incident_id: int, client_event_id: str,
                     latitude: float, longitude: float, confidence: float, source: str,
@@ -402,6 +501,12 @@ class MaritimeSARService:
                 raise DomainError("资源状态已变化，请刷新后重试", 409)
             if asset["status"] == "available":
                 raise DomainError("资源当前未分配", 409)
+            active_watch = conn.execute(
+                "SELECT id FROM asset_watches WHERE asset_id=? AND status IN ('on_duty','overdue','returning')",
+                (asset_id,),
+            ).fetchone()
+            if active_watch:
+                raise DomainError("装备出海值守中，请先确认进港，不能直接撤回", 409)
             now = utcnow()
             areas = conn.execute("SELECT id,incident_id FROM search_areas WHERE assigned_asset_id=? AND status IN ('assigned','active')", (asset_id,)).fetchall()
             for area in areas:
@@ -410,6 +515,206 @@ class MaritimeSARService:
             conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (now, asset_id))
             self._audit(conn, None, actor, "asset.withdrawn", {"asset_id": asset_id, "reason": reason.strip()})
             return dict(conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone())
+
+    def _sweep_overdue(self, conn: sqlite3.Connection, now: datetime) -> list[int]:
+        """到点未报位的值守任务转入失联栏，保留最后船位。返回变更的值守编号。"""
+        now_ts = now.isoformat(timespec="seconds")
+        rows = conn.execute(
+            """SELECT id, asset_id, incident_id, next_report_due FROM asset_watches
+               WHERE status IN ('on_duty','returning') AND next_report_due IS NOT NULL AND next_report_due <= ?""",
+            (now_ts,),
+        ).fetchall()
+        changed: list[int] = []
+        for row in rows:
+            conn.execute(
+                "UPDATE asset_watches SET status='overdue',overdue_since=COALESCE(overdue_since,next_report_due),updated_at=? WHERE id=?",
+                (now_ts, row["id"]),
+            )
+            self._audit(conn, row["incident_id"], "system", "watch.overdue", {
+                "watch_id": row["id"], "asset_id": row["asset_id"],
+                "due_at": row["next_report_due"], "detected_at": now_ts,
+            })
+            changed.append(row["id"])
+        return changed
+
+    def report_position(self, actor: str, role: str, asset_id: int,
+                        latitude: Any, longitude: Any, remaining_margin_km: Any,
+                        note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator", "operator", "field"}, "定时报位")
+        lat, lon = validate_position(latitude, longitude)
+        try:
+            margin = float(remaining_margin_km)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("最低返航余量必须是数值") from exc
+        if margin < 0:
+            raise DomainError("返航余量不能为负")
+        now = datetime.now(timezone.utc)
+        now_ts = now.isoformat(timespec="seconds")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._sweep_overdue(conn, now)
+            watch = conn.execute(
+                "SELECT * FROM asset_watches WHERE asset_id=? AND status IN ('on_duty','overdue','returning') ORDER BY id DESC",
+                (asset_id,),
+            ).fetchone()
+            if not watch:
+                raise DomainError("该装备没有进行中的值守任务，无法报位", 409)
+            was_overdue = watch["status"] == "overdue"
+            new_status = "returning" if margin < watch["min_return_margin_km"] else "on_duty"
+            due = (now + timedelta(minutes=watch["report_interval_min"])).isoformat(timespec="seconds")
+            conn.execute(
+                """UPDATE asset_watches SET status=?,last_report_at=?,last_lat=?,last_lon=?,last_margin_km=?,
+                   next_report_due=?,overdue_since=NULL,updated_at=? WHERE id=?""",
+                (new_status, now_ts, lat, lon, margin, due, now_ts, watch["id"]),
+            )
+            conn.execute(
+                "UPDATE assets SET latitude=?,longitude=?,updated_at=? WHERE id=?",
+                (lat, lon, now_ts, asset_id),
+            )
+            conn.execute(
+                """INSERT INTO position_reports(watch_id,asset_id,latitude,longitude,margin_km,source_status,reporter,note,reported_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (watch["id"], asset_id, lat, lon, margin, watch["status"], actor, note.strip(), now_ts),
+            )
+            self._audit(conn, watch["incident_id"], actor, "watch.position_reported", {
+                "watch_id": watch["id"], "asset_id": asset_id, "latitude": lat, "longitude": lon,
+                "margin_km": margin, "restored": was_overdue, "new_status": new_status,
+            })
+            if was_overdue:
+                self._audit(conn, watch["incident_id"], actor, "watch.contact_restored", {
+                    "watch_id": watch["id"], "asset_id": asset_id,
+                    "latitude": lat, "longitude": lon, "margin_km": margin,
+                })
+            if new_status == "returning" and watch["status"] != "returning":
+                self._audit(conn, watch["incident_id"], actor, "watch.returning", {
+                    "watch_id": watch["id"], "asset_id": asset_id,
+                    "margin_km": margin, "line_km": watch["min_return_margin_km"],
+                })
+            return dict(conn.execute("SELECT * FROM asset_watches WHERE id=?", (watch["id"],)).fetchone())
+
+    def confirm_arrival(self, actor: str, role: str, asset_id: int,
+                        expected_asset_version: int | None = None, note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "确认进港")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if not asset:
+                raise DomainError("资源不存在", 404)
+            if expected_asset_version is not None and asset["version"] != int(expected_asset_version):
+                raise DomainError("资源状态已变化，请刷新后重试", 409)
+            watch = conn.execute(
+                "SELECT * FROM asset_watches WHERE asset_id=? AND status IN ('on_duty','overdue','returning') ORDER BY id DESC",
+                (asset_id,),
+            ).fetchone()
+            if not watch:
+                raise DomainError("该装备没有进行中的出海值守任务", 409)
+            now_ts = utcnow()
+            if watch["area_id"] is not None:
+                area = conn.execute("SELECT * FROM search_areas WHERE id=?", (watch["area_id"],)).fetchone()
+                if area and area["status"] in ("assigned", "active"):
+                    conn.execute(
+                        "UPDATE search_areas SET assigned_asset_id=NULL,status='planned',version=version+1,updated_at=? WHERE id=?",
+                        (now_ts, watch["area_id"]),
+                    )
+                    self._audit(conn, watch["incident_id"], actor, "area.unassigned", {
+                        "area_id": watch["area_id"], "reason": "装备确认进港",
+                    })
+            conn.execute(
+                "UPDATE asset_watches SET status='in_port',arrived_at=?,next_report_due=NULL,overdue_since=NULL,updated_at=? WHERE id=?",
+                (now_ts, now_ts, watch["id"]),
+            )
+            conn.execute(
+                "UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?",
+                (now_ts, asset_id),
+            )
+            self._audit(conn, watch["incident_id"], actor, "watch.arrived", {
+                "watch_id": watch["id"], "asset_id": asset_id, "note": note.strip(),
+            })
+            return dict(conn.execute("SELECT * FROM asset_watches WHERE id=?", (watch["id"],)).fetchone())
+
+    def create_handover(self, actor: str, role: str, title: str, reason: str,
+                        asset_id: int | None = None, watch_id: int | None = None,
+                        follow_up: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator", "operator"}, "登记值班交接")
+        title, reason = title.strip(), reason.strip()
+        if not title or not reason:
+            raise DomainError("交接事项和待处理原因不能为空")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            resolved_watch = watch_id
+            if resolved_watch is not None:
+                watch = conn.execute("SELECT * FROM asset_watches WHERE id=?", (resolved_watch,)).fetchone()
+                if not watch:
+                    raise DomainError("值守任务不存在", 404)
+                if asset_id is not None and int(asset_id) != watch["asset_id"]:
+                    raise DomainError("值守任务与装备不一致", 409)
+                asset_id = watch["asset_id"]
+            elif asset_id is not None:
+                watch = conn.execute(
+                    "SELECT * FROM asset_watches WHERE asset_id=? ORDER BY id DESC", (asset_id,)
+                ).fetchone()
+                if not watch:
+                    raise DomainError("该装备还没有值守记录", 404)
+                resolved_watch = watch["id"]
+            now_ts = utcnow()
+            cur = conn.execute(
+                """INSERT INTO watch_handovers(watch_id,asset_id,title,reason,status,created_by,owned_by,follow_up,created_at,updated_at)
+                   VALUES(?,?,?,?, 'open',?,?,?,?,?)""",
+                (resolved_watch, asset_id, title, reason, actor, actor, follow_up.strip(), now_ts, now_ts),
+            )
+            self._audit(conn, watch["incident_id"] if resolved_watch is not None else None, actor, "handover.created", {
+                "handover_id": cur.lastrowid, "title": title, "asset_id": asset_id,
+            })
+            return dict(conn.execute("SELECT * FROM watch_handovers WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def update_handover(self, actor: str, role: str, handover_id: int,
+                        status: str | None = None, follow_up: str | None = None,
+                        reason: str | None = None, title: str | None = None) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator", "operator"}, "处理值班交接")
+        updates: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            status = status.strip()
+            if status not in {"open", "following", "resolved"}:
+                raise DomainError("交接事项状态无效")
+            updates.append("status=?")
+            params.append(status)
+        if follow_up is not None:
+            updates.append("follow_up=?")
+            params.append(follow_up.strip())
+        if reason is not None:
+            if not reason.strip():
+                raise DomainError("待处理原因不能为空")
+            updates.append("reason=?")
+            params.append(reason.strip())
+        if title is not None:
+            if not title.strip():
+                raise DomainError("交接事项标题不能为空")
+            updates.append("title=?")
+            params.append(title.strip())
+        if not updates:
+            raise DomainError("没有需要更新的交接内容")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM watch_handovers WHERE id=?", (handover_id,)).fetchone()
+            if not row:
+                raise DomainError("交接事项不存在", 404)
+            updates.append("updated_at=?")
+            params.append(utcnow())
+            params.append(handover_id)
+            conn.execute("UPDATE watch_handovers SET %s WHERE id=?" % ",".join(updates), params)
+            watch = conn.execute("SELECT incident_id FROM asset_watches WHERE id=?", (row["watch_id"],)).fetchone() if row["watch_id"] else None
+            incident_id = watch["incident_id"] if watch else None
+            self._audit(conn, incident_id, actor, "handover.updated", {
+                "handover_id": handover_id,
+                "status": status if status is not None else row["status"],
+                "follow_up": follow_up.strip() if follow_up is not None else row["follow_up"],
+            })
+            return dict(conn.execute("SELECT * FROM watch_handovers WHERE id=?", (handover_id,)).fetchone())
 
     def transfer_incident(self, actor: str, role: str, incident_id: int, new_org: str,
                           expected_version: int, note: str = "") -> dict[str, Any]:
@@ -450,6 +755,12 @@ class MaritimeSARService:
             if expected_version is not None and area["version"] != int(expected_version):
                 raise DomainError("搜索区域已变化，请刷新后重试", 409)
             if area["assigned_asset_id"] is not None:
+                active_watch = conn.execute(
+                    "SELECT 1 FROM asset_watches WHERE asset_id=? AND status IN ('on_duty','overdue','returning')",
+                    (area["assigned_asset_id"],),
+                ).fetchone()
+                if active_watch:
+                    raise DomainError("装备仍在出海值守，请先确认进港再结束区域", 409)
                 conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (utcnow(), area["assigned_asset_id"]))
             conn.execute("UPDATE search_areas SET status=?,assigned_asset_id=NULL,version=version+1,updated_at=? WHERE id=?", (outcome, utcnow(), area_id))
             self._audit(conn, area["incident_id"], actor, "area." + outcome, {"area_id": area_id})
@@ -549,13 +860,39 @@ class MaritimeSARService:
             return {"batch_id": batch_id, "idempotent": False, "status": "merged", "summary": summary}
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._sweep_overdue(conn, now)
             incidents = [dict(r) for r in conn.execute("SELECT * FROM incidents ORDER BY id DESC").fetchall()]
             areas = [dict(r) for r in conn.execute("SELECT * FROM search_areas ORDER BY priority,id").fetchall()]
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
+            watches = [dict(r) for r in conn.execute(
+                """SELECT w.*, a.name AS asset_name, a.kind AS asset_kind, sa.code AS area_code,
+                          i.code AS incident_code
+                   FROM asset_watches w
+                   JOIN assets a ON a.id=w.asset_id
+                   LEFT JOIN search_areas sa ON sa.id=w.area_id
+                   LEFT JOIN incidents i ON i.id=w.incident_id
+                   ORDER BY CASE w.status WHEN 'overdue' THEN 0 WHEN 'returning' THEN 1
+                              WHEN 'on_duty' THEN 2 ELSE 3 END, w.next_report_due, w.id DESC"""
+            ).fetchall()]
+            reports = [dict(r) for r in conn.execute(
+                """SELECT p.*, a.name AS asset_name FROM position_reports p
+                   JOIN assets a ON a.id=p.asset_id ORDER BY p.id DESC LIMIT 200"""
+            ).fetchall()]
+            handovers = [dict(r) for r in conn.execute(
+                """SELECT h.*, a.name AS asset_name, w.status AS watch_status
+                   FROM watch_handovers h
+                   LEFT JOIN assets a ON a.id=h.asset_id
+                   LEFT JOIN asset_watches w ON w.id=h.watch_id
+                   ORDER BY CASE h.status WHEN 'open' THEN 0 WHEN 'following' THEN 1 ELSE 2 END, h.id DESC"""
+            ).fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues,
+                "watches": watches, "position_reports": reports, "handovers": handovers,
+                "timeline": timeline, "server_time": now.isoformat(timespec="seconds")}
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -567,10 +904,18 @@ class MaritimeSARService:
             if conn.execute("SELECT COUNT(*) AS c FROM incidents").fetchone()["c"]:
                 return {"seeded": False, "reason": "已有数据"}
         incident = self.create_incident("coord-demo", "coordinator", "SAR-2026-001", "远星号", 31.2, 122.5, 15.0, 3, "东海搜救中心", description="演示遇险事件")
-        self.add_asset("coord-demo", "coordinator", "海巡01", "vessel", ["surface", "night"], 31.0, 122.0, 22.0, 180.0, 6)
+        vessel = self.add_asset("coord-demo", "coordinator", "海巡01", "vessel", ["surface", "night"], 31.0, 122.0, 22.0, 180.0, 6)
         self.add_asset("coord-demo", "coordinator", "救助直升机", "aircraft", ["air", "night"], 30.8, 122.1, 180.0, 260.0, 5)
-        self.create_search_area("coord-demo", "coordinator", incident["id"], "AREA-A", "surface", 31.2, 122.5, 20.0, 1, "首要搜索区")
-        return {"seeded": True, "incident_id": incident["id"]}
+        area = self.create_search_area("coord-demo", "coordinator", incident["id"], "AREA-A", "surface", 31.2, 122.5, 20.0, 1, "首要搜索区")
+        eta = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(timespec="seconds")
+        assignment = self.assign_area(
+            "coord-demo", "coordinator", area["id"], vessel["id"], eta, 60, 40.0
+        )
+        self.report_position("coord-demo", "coordinator", vessel["id"], 31.18, 122.45, 92.0, "首次报位，航向搜索区")
+        self.create_handover("coord-demo", "coordinator", "海巡01 夜间接听频道确认",
+                             "18 点后改由夜班值守，重点关注报位是否准时；若余量跌破 40 公里立即催返航",
+                             asset_id=vessel["id"], follow_up="")
+        return {"seeded": True, "incident_id": incident["id"], "watch_id": assignment["watch_id"]}
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -641,6 +986,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.create_search_area(actor, role, **data)
             elif path == "/api/assignments":
                 result = self.service.assign_area(actor, role, **data)
+            elif path == "/api/watches/position":
+                result = self.service.report_position(actor, role, **data)
+            elif path == "/api/watches/arrival":
+                result = self.service.confirm_arrival(actor, role, **data)
+            elif path == "/api/handovers":
+                result = self.service.create_handover(actor, role, **data)
+            elif path == "/api/handovers/update":
+                result = self.service.update_handover(actor, role, **data)
             elif path == "/api/clues":
                 result = self.service.record_clue(actor, role, **data)
             elif path == "/api/clues/verify":

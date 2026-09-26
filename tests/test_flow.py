@@ -1,10 +1,15 @@
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import DomainError, MaritimeSARService  # noqa: E402
+
+
+def eta(hours: float = 6) -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
 class MaritimeSARFlowTest(unittest.TestCase):
@@ -25,7 +30,7 @@ class MaritimeSARFlowTest(unittest.TestCase):
         area = self.service.create_search_area(
             "coord1", "coordinator", self.incident["id"], "A-01", "surface", 31.1, 122.1, 8, 1
         )
-        assigned = self.service.assign_area("coord1", "coordinator", area["id"], self.asset["id"], self.asset["version"])
+        assigned = self.service.assign_area("coord1", "coordinator", area["id"], self.asset["id"], eta(), 30, 30.0)
         self.assertEqual("assigned", assigned["status"])
         clue = self.service.record_clue(
             "field1", "field", self.incident["id"], "evt-1", 31.1, 122.1, 0.9, "visual", area["id"]
@@ -39,7 +44,11 @@ class MaritimeSARFlowTest(unittest.TestCase):
         self.assertEqual(1, batch["summary"]["accepted"])
         self.assertTrue(self.service.merge_offline_batch("field1", "field", "batch-1", [])["idempotent"])
         updated_asset = self.service.list_assets()[0]
-        self.service.withdraw_asset("coord1", "coordinator", self.asset["id"], "任务移交", updated_asset["version"])
+        with self.assertRaises(DomainError) as ctx:
+            self.service.withdraw_asset("coord1", "coordinator", self.asset["id"], "任务移交", updated_asset["version"])
+        self.assertEqual(409, ctx.exception.status)
+        arrived = self.service.confirm_arrival("coord1", "coordinator", self.asset["id"], updated_asset["version"], "任务结束")
+        self.assertEqual("in_port", arrived["status"])
         current_area = self.service.state()["search_areas"][0]
         self.service.complete_area("coord1", "coordinator", area["id"], "abandoned", current_area["version"])
         current_incident = [x for x in self.service.state()["incidents"] if x["id"] == self.incident["id"]][0]
@@ -64,12 +73,12 @@ class MaritimeSARFlowTest(unittest.TestCase):
         area = self.service.create_search_area(
             "coord1", "coordinator", self.incident["id"], "A-02", "surface", 31.1, 122.1, 5
         )
-        self.service.assign_area("coord1", "coordinator", area["id"], self.asset["id"], self.asset["version"])
+        self.service.assign_area("coord1", "coordinator", area["id"], self.asset["id"], eta(), 30, 30.0)
         area2 = self.service.create_search_area(
             "coord1", "coordinator", self.incident["id"], "A-03", "surface", 31.2, 122.2, 5
         )
         with self.assertRaises(DomainError) as ctx:
-            self.service.assign_area("coord1", "coordinator", area2["id"], self.asset["id"], self.asset["version"])
+            self.service.assign_area("coord1", "coordinator", area2["id"], self.asset["id"], eta(), 30, 30.0)
         self.assertEqual(409, ctx.exception.status)
         with self.assertRaises(DomainError) as ctx2:
             self.service.create_search_area("field1", "field", self.incident["id"], "A-04", "surface", 31, 122, 5)
